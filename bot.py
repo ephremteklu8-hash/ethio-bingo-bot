@@ -619,3 +619,67 @@ async def leaderboard(
         await update.message.reply_text(
             "❌ Could not get leaderboard."
         )
+# =========================================================
+# /LEADERBOARD
+# =========================================================
+
+async def leaderboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    try:
+        ensure_user(update.effective_user)
+
+        rows = db_execute(
+            """
+            SELECT
+                user_id,
+                username,
+                first_name,
+                points
+            FROM users
+            WHERE points > 0
+            ORDER BY points DESC
+            LIMIT 10
+            """,
+            fetch=True,
+        )
+
+        if not rows:
+            await update.message.reply_text(
+                "🏆 Ethio Bingo Leaderboard\n\n"
+                "No players have points yet."
+            )
+            return
+
+        text = "🏆 Ethio Bingo Leaderboard\n\n"
+
+        medals = ["🥇", "🥈", "🥉"]
+
+        for i, row in enumerate(rows):
+            name = (
+                row["first_name"]
+                or row["username"]
+                or "Player"
+            )
+
+            if i < 3:
+                medal = medals[i]
+            else:
+                medal = f"{i + 1}."
+
+            text += (
+                f"{medal} {name} — "
+                f"💰 {row['points']} points\n"
+            )
+
+        text += "\n🎯 Top 10 players"
+
+        await update.message.reply_text(text)
+
+    except Exception:
+        logger.exception("Error in /leaderboard")
+
+        await update.message.reply_text(
+            "❌ Could not get leaderboard."
+        )
