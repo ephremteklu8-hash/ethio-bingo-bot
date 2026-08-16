@@ -305,8 +305,28 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+# Render Web Service health server
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def home():
+    return "Ethio Bingo Bot is running! 🎲", 200
+
+@web_app.route("/health")
+def health():
+    return "OK", 200
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
+
+
 def main():
     init_db()
+
+    # Start Render web server
+    threading.Thread(target=run_web_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -319,6 +339,7 @@ def main():
 
     logger.info("Ethio Bingo bot is starting...")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
