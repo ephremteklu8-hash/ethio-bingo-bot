@@ -595,12 +595,25 @@ async def points(
             f"💰 Your points: *{value}*",
             parse_mode="Markdown",
         )
+async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        ensure_user(update.effective_user)
+
+        rows = db_execute(
+            "SELECT points FROM users WHERE user_id=?",
+            (update.effective_user.id,),
+            fetch=True,
+        )
+
+        value = rows[0]["points"] if rows else 0
+
+        await update.message.reply_text(
+            f"💰 Your points: *{value}*",
+            parse_mode="Markdown",
+        )
 
     except Exception:
-
-        logger.exception(
-            "Error in /points"
-        )
+        logger.exception("Error in /points")
 
         await update.message.reply_text(
             "❌ Could not get your points."
