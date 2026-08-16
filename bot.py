@@ -4,7 +4,6 @@ import sqlite3
 import logging
 import threading
 import ast
-
 from flask import Flask
 from datetime import datetime
 
@@ -15,8 +14,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
+
 # =========================================================
-# CONFIG
+# SETTINGS
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -51,41 +51,30 @@ logger = logging.getLogger(__name__)
 
 conn = sqlite3.connect(
     DB_FILE,
-    check_same_thread=False,
-    timeout=30,
+    check_same_thread=False
 )
 
 conn.row_factory = sqlite3.Row
 
-DB_LOCK = threading.RLock()
-
 
 def db_execute(sql, params=(), fetch=False, many=False):
-    with DB_LOCK:
-        cur = conn.cursor()
+    cur = conn.cursor()
 
-        try:
-            if many:
-                cur.executemany(sql, params)
-            else:
-                cur.execute(sql, params)
+    if many:
+        cur.executemany(sql, params)
+    else:
+        cur.execute(sql, params)
 
-            if fetch:
-                return cur.fetchall()
+    conn.commit()
 
-            conn.commit()
-            return cur.lastrowid
+    if fetch:
+        return cur.fetchall()
 
-        except Exception:
-            conn.rollback()
-            logger.exception("Database error")
-            raise
-
-        finally:
-            cur.close()
+    return cur.lastrowid
 
 
 def init_db():
+
     db_execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -115,16 +104,14 @@ def init_db():
         )
     """)
 
-    logger.info("Database initialized.")
-
 
 # =========================================================
 # USER
 # =========================================================
 
 def ensure_user(user):
-    db_execute(
-        """
+
+    db_execute("""
         INSERT INTO users(
             user_id,
             username,
@@ -134,24 +121,54 @@ def ensure_user(user):
         )
         VALUES (?, ?, ?, 0, ?)
 
-        ON CONFLICT(user_id) DO UPDATE SET
+        ON CONFLICT(user_id)
+        DO UPDATE SET
             username=excluded.username,
             first_name=excluded.first_name
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+        datetime.utcnow().isoformat(),
+    ))
+
+
+def get_user_name(user_id):
+
+    rows = db_execute(
+        """
+        SELECT username, first_name
+        FROM users
+        WHERE user_id=?
         """,
-        (
-            user.id,
-            user.username or "",
-            user.first_name or "",
-            datetime.utcnow().isoformat(),
-        ),
+        (user_id,),
+        fetch=True,
     )
+
+    if not rows:
+        return f"Player {user_id}"
+
+    username = rows[0]["username"]
+    first_name = rows[0]["first_name"]
+
+    if first_name and username:
+        return f"{first_name} (@{username})"
+
+    if first_name:
+        return first_name
+
+    if username:
+        return f"@{username}"
+
+    return f"Player {user_id}"
 
 
 # =========================================================
-# GAME HELPERS
+# GAME
 # =========================================================
 
 def active_game():
+
     rows = db_execute(
         """
         SELECT *
@@ -167,6 +184,7 @@ def active_game():
 
 
 def get_card(game_id, user_id):
+
     rows = db_execute(
         """
         SELECT *
@@ -180,30 +198,76 @@ def get_card(game_id, user_id):
     return rows[0] if rows else None
 
 
+# =========================================================
+# BINGO CARD
+# =========================================================
+
+def make_card():
+
+    cols = [
+
+        random.sample(
+            range(1, 16),
+            5
+        ),
+
+        random.sample(
+            range(16, 31),
+            5
+        ),
+
+        random.sample(
+            range(31, 46),
+            5
+        ),
+
+        random.sample(
+            range(46, 61),
+            5
+        ),
+
+        random.sample(
+            range(61, 76),
+            5
+        ),
+    ]
+
+    grid = [
+        [
+            cols[c][r]
+            for c in range(5)
+        ]
+        for r in range(5)
+    ]
+
+    # FREE center
+    grid[2][2] = 0
+
+    return grid
+
+
+def parse_grid(value):
+
+    try:
+        return ast.literal_eval(value)
+    except Exception:
+        return []
+
+
 def parse_numbers(value):
+
     if not value:
         return set()
 
-    result = set()
-
-    for x in value.split(","):
-        x = x.strip()
-
-        if not x:
-            continue
-
-        try:
-            result.add(int(x))
-        except ValueError:
-            logger.warning(
-                "Invalid number: %s",
-                x,
-            )
-
-    return result
+    return {
+        int(x)
+        for x in value.split(",")
+        if x.strip()
+    }
 
 
 def numbers_text(numbers):
+
     return ",".join(
         str(x)
         for x in sorted(numbers)
@@ -211,73 +275,14 @@ def numbers_text(numbers):
 
 
 # =========================================================
-# BINGO CARD
+# BINGO CHECK
 # =========================================================
-
-def make_card():
-    """
-    Standard Bingo:
-
-    B = 1-15
-    I = 16-30
-    N = 31-45
-    G = 46-60
-    O = 61-75
-
-    Center = FREE
-    """
-
-    columns = [
-        random.sample(range(1, 16), 5),
-        random.sample(range(16, 31), 5),
-        random.sample(range(31, 46), 5),
-        random.sample(range(46, 61), 5),
-        random.sample(range(61, 76), 5),
-    ]
-
-    grid = [
-        [
-            columns[c][r]
-            for c in range(5)
-        ]
-        for r in range(5)
-    ]
-
-    grid[2][2] = 0
-
-    return grid
-
-
-def load_grid(value):
-    try:
-        grid = ast.literal_eval(value)
-
-        if not isinstance(grid, list):
-            raise ValueError("Invalid grid.")
-
-        if len(grid) != 5:
-            raise ValueError("Grid must have 5 rows.")
-
-        for row in grid:
-            if not isinstance(row, list):
-                raise ValueError("Invalid row.")
-
-            if len(row) != 5:
-                raise ValueError(
-                    "Each row must contain 5 numbers."
-                )
-
-        return grid
-
-    except Exception:
-        logger.exception("Invalid Bingo card.")
-        raise
-
 
 def is_bingo(grid, called):
 
     # Rows
     for r in range(5):
+
         if all(
             grid[r][c] == 0
             or grid[r][c] in called
@@ -287,6 +292,7 @@ def is_bingo(grid, called):
 
     # Columns
     for c in range(5):
+
         if all(
             grid[r][c] == 0
             or grid[r][c] in called
@@ -313,31 +319,38 @@ def is_bingo(grid, called):
     return False
 
 
+# =========================================================
+# CARD DISPLAY
+# =========================================================
+
 def card_text(grid, marked):
 
     lines = [
         "🎫 *Your Bingo Card*",
         "```",
-        " B   I   N   G   O",
+        " B   I   N   G   O"
     ]
 
     for row in grid:
 
         cells = []
 
-        for number in row:
+        for n in row:
 
-            if number == 0:
+            if n == 0:
+
                 cells.append(" ★ ")
 
-            elif number in marked:
+            elif n in marked:
+
                 cells.append(
-                    f"[{number:2}]"
+                    f"[{n:2}]"
                 )
 
             else:
+
                 cells.append(
-                    f" {number:2} "
+                    f" {n:2} "
                 )
 
         lines.append(
@@ -354,7 +367,7 @@ def card_text(grid, marked):
 
 
 # =========================================================
-# ADMIN
+# ADMIN CHECK
 # =========================================================
 
 def admin_only(update):
@@ -372,34 +385,22 @@ def admin_only(update):
 
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    try:
+    ensure_user(
+        update.effective_user
+    )
 
-        ensure_user(
-            update.effective_user
-        )
-
-        await update.message.reply_text(
-            "🎉 Welcome to *Ethio Bingo*!\n\n"
-            "🎫 /join - Join the game\n"
-            "🎟️ /card - Show your card\n"
-            "💰 /points - Show your points\n"
-            "🏆 /leaderboard - Top players\n"
-            "❓ /help - Show commands",
-            parse_mode="Markdown",
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Error in /start"
-        )
-
-        await update.message.reply_text(
-            "❌ Something went wrong."
-        )
+    await update.message.reply_text(
+        "🎉 Welcome to *Ethio Bingo*!\n\n"
+        "Use /join to enter the current game.\n"
+        "Use /card to view your card.\n"
+        "Use /points to see your points.\n"
+        "Use /leaderboard to see the top players.\n"
+        "Use /help to see all commands.",
+        parse_mode="Markdown",
+    )
 
 
 # =========================================================
@@ -408,82 +409,66 @@ async def start(
 
 async def join(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    try:
+    ensure_user(
+        update.effective_user
+    )
 
-        ensure_user(
-            update.effective_user
+    game = active_game()
+
+    if not game:
+
+        await update.message.reply_text(
+            "⏳ No active game.\n"
+            "Ask the admin to use /newgame."
         )
 
-        game = active_game()
+        return
 
-        if not game:
+    existing = get_card(
+        game["id"],
+        update.effective_user.id
+    )
 
-            await update.message.reply_text(
-                "⏳ No active game.\n\n"
-                "Ask the admin to use /newgame."
-            )
+    if existing:
 
-            return
+        await update.message.reply_text(
+            "✅ You are already in this game.\n"
+            "Use /card to view your card."
+        )
 
-        existing = get_card(
+        return
+
+    grid = make_card()
+
+    db_execute(
+        """
+        INSERT INTO cards(
+            game_id,
+            user_id,
+            numbers,
+            marked
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
             game["id"],
             update.effective_user.id,
-        )
+            repr(grid),
+            "",
+        ),
+    )
 
-        if existing:
-
-            await update.message.reply_text(
-                "✅ You are already in this game.\n"
-                "Use /card."
-            )
-
-            return
-
-        grid = make_card()
-
-        db_execute(
-            """
-            INSERT INTO cards(
-                game_id,
-                user_id,
-                numbers,
-                marked
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                game["id"],
-                update.effective_user.id,
-                repr(grid),
-                "",
-            ),
-        )
-
-        called = parse_numbers(
-            game["called_numbers"]
-        )
-
-        await update.message.reply_text(
-            "🎫 You joined the game!\n\n"
-            + card_text(
-                grid,
-                called,
-            ),
-            parse_mode="Markdown",
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Error in /join"
-        )
-
-        await update.message.reply_text(
-            "❌ Could not join the game."
-        )
+    await update.message.reply_text(
+        "🎫 You joined the game!\n\n"
+        + card_text(
+            grid,
+            set()
+        ),
+        parse_mode="Markdown",
+    )
 
 
 # =========================================================
@@ -492,70 +477,52 @@ async def join(
 
 async def card(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    try:
+    ensure_user(
+        update.effective_user
+    )
 
-        ensure_user(
-            update.effective_user
-        )
+    game = active_game()
 
-        game = active_game()
-
-        if not game:
-
-            await update.message.reply_text(
-                "⏳ There is no active game."
-            )
-
-            return
-
-        c = get_card(
-            game["id"],
-            update.effective_user.id,
-        )
-
-        if not c:
-
-            await update.message.reply_text(
-                "❌ You are not in the game.\n"
-                "Use /join first."
-            )
-
-            return
-
-        grid = load_grid(
-            c["numbers"]
-        )
-
-        called = parse_numbers(
-            game["called_numbers"]
-        )
-
-        marked = parse_numbers(
-            c["marked"]
-        )
-
-        marked.update(called)
+    if not game:
 
         await update.message.reply_text(
-            card_text(
-                grid,
-                marked,
-            ),
-            parse_mode="Markdown",
+            "⏳ There is no active game."
         )
 
-    except Exception:
+        return
 
-        logger.exception(
-            "Error in /card"
-        )
+    c = get_card(
+        game["id"],
+        update.effective_user.id
+    )
+
+    if not c:
 
         await update.message.reply_text(
-            "❌ Could not load your card."
+            "You are not in the game.\n"
+            "Use /join first."
         )
+
+        return
+
+    grid = parse_grid(
+        c["numbers"]
+    )
+
+    marked = parse_numbers(
+        c["marked"]
+    )
+
+    await update.message.reply_text(
+        card_text(
+            grid,
+            marked
+        ),
+        parse_mode="Markdown",
+    )
 
 
 # =========================================================
@@ -564,60 +531,35 @@ async def card(
 
 async def points(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    try:
+    ensure_user(
+        update.effective_user
+    )
 
-        ensure_user(
-            update.effective_user
-        )
+    rows = db_execute(
+        """
+        SELECT points
+        FROM users
+        WHERE user_id=?
+        """,
+        (
+            update.effective_user.id,
+        ),
+        fetch=True,
+    )
 
-        rows = db_execute(
-            """
-            SELECT points
-            FROM users
-            WHERE user_id=?
-            """,
-            (
-                update.effective_user.id,
-            ),
-            fetch=True,
-        )
+    value = (
+        rows[0]["points"]
+        if rows
+        else 0
+    )
 
-        value = (
-            rows[0]["points"]
-            if rows
-            else 0
-        )
-
-        await update.message.reply_text(
-            f"💰 Your points: *{value}*",
-            parse_mode="Markdown",
-        )
-async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        ensure_user(update.effective_user)
-
-        rows = db_execute(
-            "SELECT points FROM users WHERE user_id=?",
-            (update.effective_user.id,),
-            fetch=True,
-        )
-
-        value = rows[0]["points"] if rows else 0
-
-        await update.message.reply_text(
-            f"💰 Your points: *{value}*",
-            parse_mode="Markdown",
-        )
-
-    except Exception:
-        logger.exception("Error in /points")
-
-        await update.message.reply_text(
-            "❌ Could not get your points."
-        )
+    await update.message.reply_text(
+        f"💰 Your points: *{value}*",
+        parse_mode="Markdown",
+    )
 
 
 # =========================================================
@@ -626,78 +568,16 @@ async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def leaderboard(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    try:
-
-        rows = db_execute(
-            """
-            SELECT
-                user_id,
-                username,
-                first_name,
-                points
-            FROM users
-            WHERE points > 0
-            ORDER BY points DESC, user_id ASC
-            LIMIT 10
-            """,
-            fetch=True,
-        )
-
-        if not rows:
-
-            await update.message.reply_text(
-                "🏆 *Ethio Bingo Leaderboard*\n\n"
-                "No players have points yet.",
-                parse_mode="Markdown",
-            )
-
-            return
-
-        lines = [
-            "🏆 *Ethio Bingo Leaderboard*",
-            "",
-        ]
-
-        medals = [
-            "🥇",
-            "🥈",
-            "🥉",
-        ]
-
-        for index, row in enumerate(rows):
-
-            if index < 3:
-                position = medals[index]
-            else:
-                position = f"{index + 1}."
-
-            if row["first_name"]:
-                name = row["first_name"]
-
-            elif row["username"]:
-                name = f"@{row['username']}"
-
-            else:
-                name = str(row["user_id"])
-
-            lines.append(
-                f"{position} {name} — "
-                f"💰 *{row['points']} points*"
-            )
-
-        lines.append("")
-        lines.append(
-            "🎯 Top 10 players"
-        )
-
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-        )
-
-    except Exception:
-
-       
+    rows = db_execute(
+        """
+        SELECT
+            user_id,
+            username,
+            first_name,
+            points
+        FROM users
+        WHERE points > 0
+        ORDER BY points DESC
