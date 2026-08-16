@@ -3,17 +3,21 @@ import random
 import sqlite3
 import logging
 import threading
+import ast
+
 from flask import Flask
 from datetime import datetime
 
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
 )
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
@@ -28,25 +32,61 @@ except ValueError:
 
 DB_FILE = os.getenv("DB_FILE", "bingo.db")
 
+# =========================================================
+# LOGGING
+# =========================================================
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
 logger = logging.getLogger(__name__)
 
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+# =========================================================
+# DATABASE
+# =========================================================
+
+conn = sqlite3.connect(
+    DB_FILE,
+    check_same_thread=False,
+    timeout=30,
+)
+
 conn.row_factory = sqlite3.Row
 
+# Prevent SQLite operations from colliding
+DB_LOCK = threading.RLock()
+
+
 def db_execute(sql, params=(), fetch=False, many=False):
-    cur = conn.cursor()
-    if many:
-        cur.executemany(sql, params)
-    else:
-        cur.execute(sql, params)
-    conn.commit()
-    if fetch:
-        return cur.fetchall()
-    return cur.lastrowid
+    """
+    Safe SQLite helper.
+    """
+
+    with DB_LOCK:
+        cur = conn.cursor()
+
+        try:
+            if many:
+                cur.executemany(sql, params)
+            else:
+                cur.execute(sql, params)
+
+            if fetch:
+                return cur.fetchall()
+
+            conn.commit()
+            return cur.lastrowid
+
+        except Exception:
+            conn.rollback()
+            logger.exception("Database error")
+            raise
+
+        finally:
+            cur.close()
+
 
 def init_db():
     db_execute("""
@@ -58,6 +98,7 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
     db_execute("""
         CREATE TABLE IF NOT EXISTS games (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +107,7 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
     db_execute("""
         CREATE TABLE IF NOT EXISTS cards (
             game_id INTEGER NOT NULL,
@@ -76,270 +118,621 @@ def init_db():
         )
     """)
 
+    logger.info("Database initialized successfully.")
+
+
+# =========================================================
+# USERS
+# =========================================================
+
 def ensure_user(user):
-    db_execute("""
-        INSERT INTO users(user_id, username, first_name, points, created_at)
+    db_execute(
+        """
+        INSERT INTO users(
+            user_id,
+            username,
+            first_name,
+            points,
+            created_at
+        )
         VALUES (?, ?, ?, 0, ?)
+
         ON CONFLICT(user_id) DO UPDATE SET
             username=excluded.username,
             first_name=excluded.first_name
-    """, (
-        user.id,
-        user.username or "",
-        user.first_name or "",
-        datetime.utcnow().isoformat(),
-    ))
+        """,
+        (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            datetime.utcnow().isoformat(),
+        ),
+    )
+
+
+# =========================================================
+# GAME HELPERS
+# =========================================================
 
 def active_game():
     rows = db_execute(
-        "SELECT * FROM games WHERE active=1 ORDER BY id DESC LIMIT 1",
+        """
+        SELECT *
+        FROM games
+        WHERE active=1
+        ORDER BY id DESC
+        LIMIT 1
+        """,
         fetch=True,
     )
+
     return rows[0] if rows else None
+
 
 def get_card(game_id, user_id):
     rows = db_execute(
-        "SELECT * FROM cards WHERE game_id=? AND user_id=?",
+        """
+        SELECT *
+        FROM cards
+        WHERE game_id=? AND user_id=?
+        """,
         (game_id, user_id),
         fetch=True,
     )
+
     return rows[0] if rows else None
 
+
+def parse_numbers(value):
+    """
+    Convert:
+        '1,2,3'
+    into:
+        {1,2,3}
+    """
+
+    if not value:
+        return set()
+
+    result = set()
+
+    for x in value.split(","):
+        x = x.strip()
+
+        if not x:
+            continue
+
+        try:
+            result.add(int(x))
+        except ValueError:
+            logger.warning("Invalid number in database: %s", x)
+
+    return result
+
+
+def numbers_text(numbers):
+    return ",".join(
+        str(x)
+        for x in sorted(numbers)
+    )
+
+
+# =========================================================
+# BINGO CARD
+# =========================================================
+
 def make_card():
-    # Standard 5x5 bingo card: B(1-15), I(16-30), N(31-45), G(46-60), O(61-75)
-    cols = [
+    """
+    Standard Bingo card:
+
+    B = 1-15
+    I = 16-30
+    N = 31-45
+    G = 46-60
+    O = 61-75
+
+    Center = FREE
+    """
+
+    columns = [
         random.sample(range(1, 16), 5),
         random.sample(range(16, 31), 5),
         random.sample(range(31, 46), 5),
         random.sample(range(46, 61), 5),
         random.sample(range(61, 76), 5),
     ]
-    grid = [[cols[c][r] for c in range(5)] for r in range(5)]
-    grid[2][2] = 0  # FREE space
+
+    grid = [
+        [
+            columns[c][r]
+            for c in range(5)
+        ]
+        for r in range(5)
+    ]
+
+    # FREE center
+    grid[2][2] = 0
+
     return grid
 
-def flatten(grid):
-    return [n for row in grid for n in row]
-
-def parse_numbers(value):
-    if not value:
-        return set()
-    return {int(x) for x in value.split(",") if x.strip()}
-
-def numbers_text(numbers):
-    return ",".join(str(x) for x in sorted(numbers))
 
 def is_bingo(grid, called):
+    """
+    Check rows, columns and diagonals.
+    """
+
+    # Rows
     for r in range(5):
-        if all(grid[r][c] == 0 or grid[r][c] in called for c in range(5)):
+        if all(
+            grid[r][c] == 0 or
+            grid[r][c] in called
+            for c in range(5)
+        ):
             return True
+
+    # Columns
     for c in range(5):
-        if all(grid[r][c] == 0 or grid[r][c] in called for r in range(5)):
+        if all(
+            grid[r][c] == 0 or
+            grid[r][c] in called
+            for r in range(5)
+        ):
             return True
-    if all(grid[i][i] == 0 or grid[i][i] in called for i in range(5)):
+
+    # Main diagonal
+    if all(
+        grid[i][i] == 0 or
+        grid[i][i] in called
+        for i in range(5)
+    ):
         return True
-    if all(grid[i][4-i] == 0 or grid[i][4-i] in called for i in range(5)):
+
+    # Other diagonal
+    if all(
+        grid[i][4 - i] == 0 or
+        grid[i][4 - i] in called
+        for i in range(5)
+    ):
         return True
+
     return False
 
+
 def card_text(grid, marked):
-    lines = ["🎫 *Your Bingo Card*", "```"]
-    lines.append(" B   I   N   G   O")
+    lines = [
+        "🎫 *Your Bingo Card*",
+        "```",
+        " B   I   N   G   O",
+    ]
+
     for row in grid:
         cells = []
-        for n in row:
-            if n == 0:
+
+        for number in row:
+
+            # FREE center
+            if number == 0:
                 cells.append(" ★ ")
-            elif n in marked:
-                cells.append(f"[{n:2}]")
+
+            # Called number
+            elif number in marked:
+                cells.append(f"[{number:2}]")
+
+            # Normal number
             else:
-                cells.append(f" {n:2} ")
+                cells.append(f" {number:2} ")
+
         lines.append(" ".join(cells))
+
     lines.append("```")
-    lines.append("Numbers in `[ ]` have been called. ★ = FREE")
+    lines.append(
+        "Numbers in `[ ]` have been called. ★ = FREE"
+    )
+
     return "\n".join(lines)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    await update.message.reply_text(
-        "🎉 Welcome to *Ethio Bingo*!\n\n"
-        "Use /join to enter the current game.\n"
-        "Use /card to view your card.\n"
-        "Use /points to see your points.",
-        parse_mode="Markdown",
-    )
 
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    game = active_game()
-    if not game:
-        await update.message.reply_text("⏳ No active game. Ask the admin to use /newgame.")
-        return
+# =========================================================
+# SAFE GRID LOADING
+# =========================================================
 
-    existing = get_card(game["id"], update.effective_user.id)
-    if existing:
-        await update.message.reply_text("✅ You are already in this game. Use /card.")
-        return
+def load_grid(value):
+    """
+    Safely convert database text back into a Bingo grid.
+    """
 
-    grid = make_card()
-    db_execute(
-        "INSERT INTO cards(game_id,user_id,numbers,marked) VALUES(?,?,?,?)",
-        (game["id"], update.effective_user.id, repr(grid), ""),
-    )
-    await update.message.reply_text(
-        "🎫 You joined the game!\n\n" + card_text(grid, set()),
-        parse_mode="Markdown",
-    )
+    try:
+        grid = ast.literal_eval(value)
 
-async def card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    game = active_game()
-    if not game:
-        await update.message.reply_text("⏳ There is no active game.")
-        return
-    c = get_card(game["id"], update.effective_user.id)
-    if not c:
-        await update.message.reply_text("You are not in the game. Use /join first.")
-        return
-    grid = eval(c["numbers"], {"__builtins__": {}}, {})
-    marked = parse_numbers(c["marked"])
-    await update.message.reply_text(card_text(grid, marked), parse_mode="Markdown")
+        if not isinstance(grid, list):
+            raise ValueError("Grid is not a list.")
 
-async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    rows = db_execute(
-        "SELECT points FROM users WHERE user_id=?",
-        (update.effective_user.id,),
-        fetch=True,
-    )
-    value = rows[0]["points"] if rows else 0
-    await update.message.reply_text(f"💰 Your points: *{value}*", parse_mode="Markdown")
+        if len(grid) != 5:
+            raise ValueError("Grid must have 5 rows.")
+
+        for row in grid:
+            if not isinstance(row, list) or len(row) != 5:
+                raise ValueError("Each row must have 5 numbers.")
+
+        return grid
+
+    except Exception:
+        logger.exception("Invalid Bingo card stored in database.")
+        raise
+
+
+# =========================================================
+# ADMIN
+# =========================================================
 
 def admin_only(update):
-    return ADMIN_ID is not None and update.effective_user and update.effective_user.id == ADMIN_ID
+    return (
+        ADMIN_ID is not None
+        and update.effective_user
+        and update.effective_user.id == ADMIN_ID
+    )
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+        ensure_user(update.effective_user)
+
+        await update.message.reply_text(
+            "🎉 Welcome to *Ethio Bingo*!\n\n"
+            "Use /join to enter the current game.\n"
+            "Use /card to view your card.\n"
+            "Use /points to see your points.\n"
+            "Use /help to see all commands.",
+            parse_mode="Markdown",
+        )
+
+    except Exception:
+        logger.exception("Error in /start")
+
+        await update.message.reply_text(
+            "❌ Something went wrong. Please try again."
+        )
+
+
+# =========================================================
+# /JOIN
+# =========================================================
+
+async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+        ensure_user(update.effective_user)
+
+        game = active_game()
+
+        if not game:
+            await update.message.reply_text(
+                "⏳ No active game.\n\n"
+                "Ask the admin to use /newgame."
+            )
+            return
+
+        existing = get_card(
+            game["id"],
+            update.effective_user.id,
+        )
+
+        if existing:
+            await update.message.reply_text(
+                "✅ You are already in this game.\n"
+                "Use /card to view your card."
+            )
+            return
+
+        grid = make_card()
+
+        db_execute(
+            """
+            INSERT INTO cards(
+                game_id,
+                user_id,
+                numbers,
+                marked
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                game["id"],
+                update.effective_user.id,
+                repr(grid),
+                "",
+            ),
+        )
+
+        # Use the numbers already called in case player joins
+        # after some numbers have been called.
+        called = parse_numbers(
+            game["called_numbers"]
+        )
+
+        await update.message.reply_text(
+            "🎫 You joined the game!\n\n"
+            + card_text(grid, called),
+            parse_mode="Markdown",
+        )
+
+    except Exception:
+        logger.exception("Error in /join")
+
+        await update.message.reply_text(
+            "❌ Could not join the game. Please try again."
+        )
+
+
+# =========================================================
+# /CARD
+# =========================================================
+
+async def card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+        ensure_user(update.effective_user)
+
+        game = active_game()
+
+        if not game:
+            await update.message.reply_text(
+                "⏳ There is no active game."
+            )
+            return
+
+        c = get_card(
+            game["id"],
+            update.effective_user.id,
+        )
+
+        if not c:
+            await update.message.reply_text(
+                "❌ You are not in the game.\n"
+                "Use /join first."
+            )
+            return
+
+        grid = load_grid(c["numbers"])
+
+        # IMPORTANT:
+        # Use game called numbers too.
+        # This makes /card always show the latest state.
+        called = parse_numbers(
+            game["called_numbers"]
+        )
+
+        marked = parse_numbers(
+            c["marked"]
+        )
+
+        # Combine both
+        marked.update(called)
+
+        await update.message.reply_text(
+            card_text(grid, marked),
+            parse_mode="Markdown",
+        )
+
+    except Exception:
+        logger.exception("Error in /card")
+
+        await update.message.reply_text(
+            "❌ Could not load your card."
+        )
+
+
+# =========================================================
+# /POINTS
+# =========================================================
+
+async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+        ensure_user(update.effective_user)
+
+        rows = db_execute(
+            """
+            SELECT points
+            FROM users
+            WHERE user_id=?
+            """,
+            (update.effective_user.id,),
+            fetch=True,
+        )
+
+        value = (
+            rows[0]["points"]
+            if rows
+            else 0
+        )
+
+        await update.message.reply_text(
+            f"💰 Your points: *{value}*",
+            parse_mode="Markdown",
+        )
+
+    except Exception:
+        logger.exception("Error in /points")
+
+        await update.message.reply_text(
+            "❌ Could not get your points."
+        )
+
+
+# =========================================================
+# /NEWGAME
+# =========================================================
 
 async def newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not admin_only(update):
-        await update.message.reply_text("⛔ Admin only.")
-        return
 
-    db_execute("UPDATE games SET active=0 WHERE active=1")
-    game_id = db_execute(
-        "INSERT INTO games(active,called_numbers,created_at) VALUES(1,'',?)",
-        (datetime.utcnow().isoformat(),),
-    )
-    await update.message.reply_text(
-        f"🎲 New Bingo game #{game_id} created!\nPlayers can now use /join."
-    )
+    try:
 
-async def call_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not admin_only(update):
-        await update.message.reply_text("⛔ Admin only.")
-        return
+        if not admin_only(update):
+            await update.message.reply_text(
+                "⛔ Admin only."
+            )
+            return
 
-    game = active_game()
-    if not game:
-        await update.message.reply_text("⏳ Create a game first with /newgame.")
-        return
-
-    called = parse_numbers(game["called_numbers"])
-    remaining = [n for n in range(1, 76) if n not in called]
-    if not remaining:
-        await update.message.reply_text("🏁 All 75 numbers have been called.")
-        return
-
-    number = random.choice(remaining)
-    called.add(number)
-    db_execute(
-        "UPDATE games SET called_numbers=? WHERE id=?",
-        (numbers_text(called), game["id"]),
-    )
-
-    winner = None
-    cards = db_execute(
-        "SELECT * FROM cards WHERE game_id=?",
-        (game["id"],),
-        fetch=True,
-    )
-
-    for c in cards:
-        grid = eval(c["numbers"], {"__builtins__": {}}, {})
-        marked = parse_numbers(c["marked"])
-        marked.add(number)
+        # Close old games
         db_execute(
-            "UPDATE cards SET marked=? WHERE game_id=? AND user_id=?",
-            (numbers_text(marked), game["id"], c["user_id"]),
+            "UPDATE games SET active=0 WHERE active=1"
         )
-        if is_bingo(grid, marked):
-            winner = c["user_id"]
-            break
 
-    if winner:
-        db_execute("UPDATE users SET points=points+100 WHERE user_id=?", (winner,))
-        db_execute("UPDATE games SET active=0 WHERE id=?", (game["id"],))
+        # Create new game
+        game_id = db_execute(
+            """
+            INSERT INTO games(
+                active,
+                called_numbers,
+                created_at
+            )
+            VALUES(1, '', ?)
+            """,
+            (
+                datetime.utcnow().isoformat(),
+            ),
+        )
+
         await update.message.reply_text(
-            f"🔔 *BINGO NUMBER: {number}*\n\n"
-            f"🏆 We have a winner!\n"
-            f"👤 Player ID: `{winner}`\n"
-            f"💰 +100 points\n\n"
-            "🎉 Game finished. Admin can use /newgame for another game.",
+            f"🎲 *New Bingo Game #{game_id} created!*\n\n"
+            "Players can now use /join.",
             parse_mode="Markdown",
         )
-    else:
-        await update.message.reply_text(
-            f"🔔 *BINGO NUMBER: {number}*\n"
-            f"📢 Called numbers: {len(called)}/75",
-            parse_mode="Markdown",
+
+        logger.info(
+            "New game created: %s",
+            game_id,
         )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎲 *Ethio Bingo Commands*\n\n"
-        "/start - Register and welcome\n"
-        "/join - Join the active game\n"
-        "/card - Show your card\n"
-        "/points - Show your points\n\n"
-        "Admin:\n"
-        "/newgame - Create a new game\n"
-        "/call - Call the next number",
-        parse_mode="Markdown",
-    )
+    except Exception:
+        logger.exception("Error in /newgame")
 
-# Render Web Service health server
-web_app = Flask(__name__)
-
-@web_app.route("/")
-def home():
-    return "Ethio Bingo Bot is running! 🎲", 200
-
-@web_app.route("/health")
-def health():
-    return "OK", 200
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+        await update.message.reply_text(
+            "❌ Could not create a new game."
+        )
 
 
-def main():
-    init_db()
+# =========================================================
+# /CALL
+# =========================================================
 
-    # Start Render web server
-    threading.Thread(target=run_web_server, daemon=True).start()
+async def call_number(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    try:
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("join", join))
-    app.add_handler(CommandHandler("card", card))
-    app.add_handler(CommandHandler("points", points))
-    app.add_handler(CommandHandler("newgame", newgame))
-    app.add_handler(CommandHandler("call", call_number))
-    app.add_handler(CommandHandler("help", help_cmd))
+        logger.info(
+            "/call received from user %s",
+            update.effective_user.id
+            if update.effective_user
+            else "unknown",
+        )
 
-    logger.info("Ethio Bingo bot is starting...")
-    app.run_polling(drop_pending_updates=True)
+        # Admin check
+        if not admin_only(update):
 
+            logger.warning(
+                "Unauthorized /call attempt by %s",
+                update.effective_user.id
+                if update.effective_user
+                else "unknown",
+            )
 
-if __name__ == "__main__":
-    main()
+            await update.message.reply_text(
+                "⛔ Admin only."
+            )
+            return
+
+        # Get active game
+        game = active_game()
+
+        if not game:
+            await update.message.reply_text(
+                "⏳ Create a game first with /newgame."
+            )
+            return
+
+        # Get already called numbers
+        called = parse_numbers(
+            game["called_numbers"]
+        )
+
+        logger.info(
+            "Game #%s currently has %s called numbers.",
+            game["id"],
+            len(called),
+        )
+
+        # Numbers still available
+        remaining = [
+            number
+            for number in range(1, 76)
+            if number not in called
+        ]
+
+        if not remaining:
+
+            await update.message.reply_text(
+                "🏁 All 75 numbers have been called."
+            )
+
+            return
+
+        # Pick random number
+        number = random.choice(remaining)
+
+        called.add(number)
+
+        # Save called number
+        db_execute(
+            """
+            UPDATE games
+            SET called_numbers=?
+            WHERE id=?
+            """,
+            (
+                numbers_text(called),
+                game["id"],
+            ),
+        )
+
+        logger.info(
+            "Game #%s called number: %s",
+            game["id"],
+            number,
+        )
+
+        # =================================================
+        # CHECK ALL PLAYERS
+        # =================================================
+
+        winner = None
+
+        cards = db_execute(
+            """
+            SELECT *
+            FROM cards
+            WHERE game_id=?
+            """,
+            (game["id"],),
+            fetch=True,
+        )
+
+        logger.info(
+            "Checking %s player cards.",
+            len(cards),
+        )
+
+        for c in cards:
+
+            try:
+
+               
