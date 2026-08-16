@@ -32,6 +32,7 @@ except ValueError:
 
 DB_FILE = os.getenv("DB_FILE", "bingo.db")
 
+
 # =========================================================
 # LOGGING
 # =========================================================
@@ -42,6 +43,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
 
 # =========================================================
 # DATABASE
@@ -113,11 +115,11 @@ def init_db():
         )
     """)
 
-    logger.info("Database initialized successfully.")
+    logger.info("Database initialized.")
 
 
 # =========================================================
-# USERS
+# USER
 # =========================================================
 
 def ensure_user(user):
@@ -194,7 +196,7 @@ def parse_numbers(value):
             result.add(int(x))
         except ValueError:
             logger.warning(
-                "Invalid number in database: %s",
+                "Invalid number: %s",
                 x,
             )
 
@@ -214,7 +216,7 @@ def numbers_text(numbers):
 
 def make_card():
     """
-    Standard Bingo card:
+    Standard Bingo:
 
     B = 1-15
     I = 16-30
@@ -246,12 +248,39 @@ def make_card():
     return grid
 
 
+def load_grid(value):
+    try:
+        grid = ast.literal_eval(value)
+
+        if not isinstance(grid, list):
+            raise ValueError("Invalid grid.")
+
+        if len(grid) != 5:
+            raise ValueError("Grid must have 5 rows.")
+
+        for row in grid:
+            if not isinstance(row, list):
+                raise ValueError("Invalid row.")
+
+            if len(row) != 5:
+                raise ValueError(
+                    "Each row must contain 5 numbers."
+                )
+
+        return grid
+
+    except Exception:
+        logger.exception("Invalid Bingo card.")
+        raise
+
+
 def is_bingo(grid, called):
+
     # Rows
     for r in range(5):
         if all(
-            grid[r][c] == 0 or
-            grid[r][c] in called
+            grid[r][c] == 0
+            or grid[r][c] in called
             for c in range(5)
         ):
             return True
@@ -259,24 +288,24 @@ def is_bingo(grid, called):
     # Columns
     for c in range(5):
         if all(
-            grid[r][c] == 0 or
-            grid[r][c] in called
+            grid[r][c] == 0
+            or grid[r][c] in called
             for r in range(5)
         ):
             return True
 
     # Main diagonal
     if all(
-        grid[i][i] == 0 or
-        grid[i][i] in called
+        grid[i][i] == 0
+        or grid[i][i] in called
         for i in range(5)
     ):
         return True
 
     # Other diagonal
     if all(
-        grid[i][4 - i] == 0 or
-        grid[i][4 - i] in called
+        grid[i][4 - i] == 0
+        or grid[i][4 - i] in called
         for i in range(5)
     ):
         return True
@@ -285,6 +314,7 @@ def is_bingo(grid, called):
 
 
 def card_text(grid, marked):
+
     lines = [
         "🎫 *Your Bingo Card*",
         "```",
@@ -292,6 +322,7 @@ def card_text(grid, marked):
     ]
 
     for row in grid:
+
         cells = []
 
         for number in row:
@@ -309,9 +340,12 @@ def card_text(grid, marked):
                     f" {number:2} "
                 )
 
-        lines.append(" ".join(cells))
+        lines.append(
+            " ".join(cells)
+        )
 
     lines.append("```")
+
     lines.append(
         "Numbers in `[ ]` have been called. ★ = FREE"
     )
@@ -320,48 +354,11 @@ def card_text(grid, marked):
 
 
 # =========================================================
-# SAFE GRID LOADING
-# =========================================================
-
-def load_grid(value):
-    try:
-        grid = ast.literal_eval(value)
-
-        if not isinstance(grid, list):
-            raise ValueError(
-                "Grid is not a list."
-            )
-
-        if len(grid) != 5:
-            raise ValueError(
-                "Grid must have 5 rows."
-            )
-
-        for row in grid:
-            if not isinstance(row, list):
-                raise ValueError(
-                    "Invalid row."
-                )
-
-            if len(row) != 5:
-                raise ValueError(
-                    "Each row must have 5 numbers."
-                )
-
-        return grid
-
-    except Exception:
-        logger.exception(
-            "Invalid Bingo card in database."
-        )
-        raise
-
-
-# =========================================================
 # ADMIN
 # =========================================================
 
 def admin_only(update):
+
     return (
         ADMIN_ID is not None
         and update.effective_user
@@ -379,27 +376,29 @@ async def start(
 ):
 
     try:
+
         ensure_user(
             update.effective_user
         )
 
         await update.message.reply_text(
             "🎉 Welcome to *Ethio Bingo*!\n\n"
-            "Use /join to enter the current game.\n"
-            "Use /card to view your card.\n"
-            "Use /points to see your points.\n"
-            "Use /leaderboard to see the top players.\n"
-            "Use /help to see all commands.",
+            "🎫 /join - Join the game\n"
+            "🎟️ /card - Show your card\n"
+            "💰 /points - Show your points\n"
+            "🏆 /leaderboard - Top players\n"
+            "❓ /help - Show commands",
             parse_mode="Markdown",
         )
 
     except Exception:
+
         logger.exception(
             "Error in /start"
         )
 
         await update.message.reply_text(
-            "❌ Something went wrong. Please try again."
+            "❌ Something went wrong."
         )
 
 
@@ -413,6 +412,7 @@ async def join(
 ):
 
     try:
+
         ensure_user(
             update.effective_user
         )
@@ -420,10 +420,12 @@ async def join(
         game = active_game()
 
         if not game:
+
             await update.message.reply_text(
                 "⏳ No active game.\n\n"
                 "Ask the admin to use /newgame."
             )
+
             return
 
         existing = get_card(
@@ -432,10 +434,12 @@ async def join(
         )
 
         if existing:
+
             await update.message.reply_text(
                 "✅ You are already in this game.\n"
-                "Use /card to view your card."
+                "Use /card."
             )
+
             return
 
         grid = make_card()
@@ -472,12 +476,13 @@ async def join(
         )
 
     except Exception:
+
         logger.exception(
             "Error in /join"
         )
 
         await update.message.reply_text(
-            "❌ Could not join the game. Please try again."
+            "❌ Could not join the game."
         )
 
 
@@ -491,6 +496,7 @@ async def card(
 ):
 
     try:
+
         ensure_user(
             update.effective_user
         )
@@ -498,9 +504,11 @@ async def card(
         game = active_game()
 
         if not game:
+
             await update.message.reply_text(
                 "⏳ There is no active game."
             )
+
             return
 
         c = get_card(
@@ -509,10 +517,12 @@ async def card(
         )
 
         if not c:
+
             await update.message.reply_text(
                 "❌ You are not in the game.\n"
                 "Use /join first."
             )
+
             return
 
         grid = load_grid(
@@ -538,6 +548,7 @@ async def card(
         )
 
     except Exception:
+
         logger.exception(
             "Error in /card"
         )
@@ -557,6 +568,7 @@ async def points(
 ):
 
     try:
+
         ensure_user(
             update.effective_user
         )
@@ -585,6 +597,7 @@ async def points(
         )
 
     except Exception:
+
         logger.exception(
             "Error in /points"
         )
@@ -621,11 +634,13 @@ async def leaderboard(
         )
 
         if not rows:
+
             await update.message.reply_text(
                 "🏆 *Ethio Bingo Leaderboard*\n\n"
                 "No players have points yet.",
                 parse_mode="Markdown",
             )
+
             return
 
         lines = [
@@ -646,11 +661,14 @@ async def leaderboard(
             else:
                 position = f"{index + 1}."
 
-            name = (
-                row["first_name"]
-                or row["username"]
-                or str(row["user_id"])
-            )
+            if row["first_name"]:
+                name = row["first_name"]
+
+            elif row["username"]:
+                name = f"@{row['username']}"
+
+            else:
+                name = str(row["user_id"])
 
             lines.append(
                 f"{position} {name} — "
@@ -668,440 +686,5 @@ async def leaderboard(
         )
 
     except Exception:
-        logger.exception(
-            "Error in /leaderboard"
-        )
 
-        await update.message.reply_text(
-            "❌ Could not load leaderboard."
-        )
-
-
-# =========================================================
-# /NEWGAME
-# =========================================================
-
-async def newgame(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    try:
-
-        if not admin_only(update):
-            await update.message.reply_text(
-                "⛔ Admin only."
-            )
-            return
-
-        db_execute(
-            """
-            UPDATE games
-            SET active=0
-            WHERE active=1
-            """
-        )
-
-        game_id = db_execute(
-            """
-            INSERT INTO games(
-                active,
-                called_numbers,
-                created_at
-            )
-            VALUES(1, '', ?)
-            """,
-            (
-                datetime.utcnow().isoformat(),
-            ),
-        )
-
-        await update.message.reply_text(
-            f"🎲 *New Bingo Game #{game_id} created!*\n\n"
-            "Players can now use /join.",
-            parse_mode="Markdown",
-        )
-
-        logger.info(
-            "New game created: %s",
-            game_id,
-        )
-
-    except Exception:
-        logger.exception(
-            "Error in /newgame"
-        )
-
-        await update.message.reply_text(
-            "❌ Could not create a new game."
-        )
-
-
-# =========================================================
-# /CALL
-# =========================================================
-
-async def call_number(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    try:
-
-        logger.info(
-            "/call received from user %s",
-            update.effective_user.id
-            if update.effective_user
-            else "unknown",
-        )
-
-        if not admin_only(update):
-
-            await update.message.reply_text(
-                "⛔ Admin only."
-            )
-            return
-
-        game = active_game()
-
-        if not game:
-            await update.message.reply_text(
-                "⏳ Create a game first with /newgame."
-            )
-            return
-
-        called = parse_numbers(
-            game["called_numbers"]
-        )
-
-        remaining = [
-            number
-            for number in range(1, 76)
-            if number not in called
-        ]
-
-        if not remaining:
-
-            await update.message.reply_text(
-                "🏁 All 75 numbers have been called."
-            )
-            return
-
-        number = random.choice(
-            remaining
-        )
-
-        called.add(number)
-
-        db_execute(
-            """
-            UPDATE games
-            SET called_numbers=?
-            WHERE id=?
-            """,
-            (
-                numbers_text(called),
-                game["id"],
-            ),
-        )
-
-        logger.info(
-            "Game #%s called number: %s",
-            game["id"],
-            number,
-        )
-
-        winner = None
-
-        cards = db_execute(
-            """
-            SELECT *
-            FROM cards
-            WHERE game_id=?
-            """,
-            (
-                game["id"],
-            ),
-            fetch=True,
-        )
-
-        for c in cards:
-
-            try:
-
-                grid = load_grid(
-                    c["numbers"]
-                )
-
-                marked = parse_numbers(
-                    c["marked"]
-                )
-
-                marked.add(number)
-
-                db_execute(
-                    """
-                    UPDATE cards
-                    SET marked=?
-                    WHERE game_id=?
-                    AND user_id=?
-                    """,
-                    (
-                        numbers_text(marked),
-                        game["id"],
-                        c["user_id"],
-                    ),
-                )
-
-                if is_bingo(
-                    grid,
-                    marked,
-                ):
-
-                    winner = c["user_id"]
-
-                    logger.info(
-                        "BINGO winner: %s",
-                        winner,
-                    )
-
-                    break
-
-            except Exception:
-                logger.exception(
-                    "Error checking card for user %s",
-                    c["user_id"],
-                )
-
-        # =================================================
-        # WINNER
-        # =================================================
-
-        if winner:
-
-            db_execute(
-                """
-                UPDATE users
-                SET points=points+100
-                WHERE user_id=?
-                """,
-                (
-                    winner,
-                ),
-            )
-
-            db_execute(
-                """
-                UPDATE games
-                SET active=0
-                WHERE id=?
-                """,
-                (
-                    game["id"],
-                ),
-            )
-
-            await update.message.reply_text(
-                f"🔔 *BINGO NUMBER: {number}*\n\n"
-                "🏆 *We have a winner!*\n"
-                f"👤 Player ID: `{winner}`\n"
-                "💰 +100 points\n\n"
-                "🎉 Game finished.\n"
-                "Admin can use /newgame for another game.",
-                parse_mode="Markdown",
-            )
-
-            return
-
-        # =================================================
-        # NO WINNER
-        # =================================================
-
-        await update.message.reply_text(
-            f"🔔 *BINGO NUMBER: {number}*\n"
-            f"📢 Called numbers: {len(called)}/75",
-            parse_mode="Markdown",
-        )
-
-    except Exception:
-
-        logger.exception(
-            "CRITICAL ERROR in /call"
-        )
-
-        try:
-            await update.message.reply_text(
-                "❌ Error while calling the number.\n"
-                "Check Render logs for details."
-            )
-
-        except Exception:
-            logger.exception(
-                "Could not send error message."
-            )
-
-
-# =========================================================
-# /HELP
-# =========================================================
-
-async def help_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "🎲 *Ethio Bingo Commands*\n\n"
-        "/start - Register and welcome\n"
-        "/join - Join the active game\n"
-        "/card - Show your card\n"
-        "/points - Show your points\n"
-        "/leaderboard - Top 10 players\n"
-        "/help - Show commands\n\n"
-        "👑 *Admin Commands*\n"
-        "/newgame - Create a new game\n"
-        "/call - Call the next number",
-        parse_mode="Markdown",
-    )
-
-
-# =========================================================
-# RENDER WEB SERVER
-# =========================================================
-
-web_app = Flask(__name__)
-
-
-@web_app.route("/")
-def home():
-    return (
-        "Ethio Bingo Bot is running! 🎲",
-        200,
-    )
-
-
-@web_app.route("/health")
-def health():
-    return (
-        "OK",
-        200,
-    )
-
-
-def run_web_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000,
-        )
-    )
-
-    logger.info(
-        "Starting web server on port %s",
-        port,
-    )
-
-    web_app.run(
-        host="0.0.0.0",
-        port=port,
-    )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    logger.info(
-        "Starting Ethio Bingo Bot..."
-    )
-
-    init_db()
-
-    web_thread = threading.Thread(
-        target=run_web_server,
-        daemon=True,
-    )
-
-    web_thread.start()
-
-    app = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "join",
-            join,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "card",
-            card,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "points",
-            points,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "leaderboard",
-            leaderboard,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "newgame",
-            newgame,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "call",
-            call_number,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "help",
-            help_cmd,
-        )
-    )
-
-    logger.info(
-        "Ethio Bingo bot is ready."
-    )
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
-
-
-# =========================================================
-# RUN
-# =========================================================
-
-if __name__ == "__main__":
-    main()
+       
